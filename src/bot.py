@@ -48,59 +48,96 @@ def save_history(history: List[str]):
 from playwright.sync_api import sync_playwright
 
 def fetch_latest_jobs() -> List[Job]:
-    """Scrape the 'Latest roles' from the Mercor app using Playwright (infinite scroll)."""
+    """Scrape the 'Latest roles' from the Mercor app or 'Explore' page using Playwright."""
     jobs = []
     try:
         with sync_playwright() as p:
-            # Use headless chromium
-            browser = p.chromium.launch(headless=True)
-            # Create context with user agent to avoid basic blocks
+            # Run visible for debugging & ensuring assets load (sometimes headless is blocked)
+            browser = p.chromium.launch(headless=False) 
+            
             context = browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                viewport={'width': 1280, 'height': 800}
+                viewport={'width': 1366, 'height': 768}
             )
             page = context.new_page()
             
             logger.info(f"Navigating to {MERCOR_URL}...")
-            # Try the work.mercor.com/explore page directly
+            # Use the explore URL clearly
             explore_url = "https://work.mercor.com/explore"
             page.goto(explore_url, timeout=60000)
             
-            # Wait for some content to load (job cards usually have links with 'jobs/list_')
+            # Wait for any network activity to settle
             try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except:
+                pass # Continue even if network is busy
+            
+            # Check if redirected to login
+            if "/login" in page.url or "auth-wall" in page.url:
+                logger.error(f"Redirected to login/auth page: {page.url}. Cannot scrape public jobs.")
+                browser.close()
+                return []
+            
+            logger.info("Checking for job cards...")
+            # Wait for *any* link that might be a job, or at least the container
+            try:
+                # Based on user report, links contain 'jobs/list_'
                 page.wait_for_selector('a[href*="jobs/list_"]', timeout=30000)
             except Exception as e:
-                logger.warning(f"Timeout waiting for job selector: {e}")
-            
-            # Scroll down multiple times to trigger infinite scroll
-            logger.info("Scrolling to load more jobs...")
-            for _ in range(5):  # Scroll 5 times
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(2000)  # Wait for load
+                logger.warning(f"Timeout waiting for job selector on {page.url}. Page title: {page.title()}")
+                # Dump content snippet to log for debugging
+                content_snippet = page.content()[:500]
+                logger.debug(f"Page content snippet: {content_snippet}")
                 
-            # Now parse content
-            content = page.content()
-            soup = BeautifulSoup(content, 'html.parser')
+            # Pagination Loop
+            max_pages = 5
+            current_page = 1
             
-            # Find all links that look like job details
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                if 'jobs/list_' in href:
-                    job_id = href.split('list_')[-1]
-                    title = link.get_text(strip=True)
-                    
-                    # Fix relative URLs
-                    if href.startswith('/'):
-                        href = f"https://work.mercor.com{href}"
-                    elif href.startswith('jobs/'):
-                         href = f"https://work.mercor.com/{href}"
-
-                    # Cleanup title
-                    if len(title) > 100:
-                        title = title[:100] + "..."
-                    
-                    if title: # Only add if title exists
-                        jobs.append(Job(id=job_id, title=title, url=href))
+            while current_page <= max_pages:
+                logger.info(f"Scraping page {current_page}...")
+                
+                # Parse current page
+                content = page.content()
+                soup = BeautifulSoup(content, 'html.parser')
+                
+                found_on_page = 0
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    if 'jobs/list_' in href:
+                        job_id = href.split('list_')[-1]
+                        title = link.get_text(strip=True)
+                        
+                        if href.startswith('/'):
+                            href = f"https://work.mercor.com{href}"
+                        elif href.startswith('jobs/'):
+                             href = f"https://work.mercor.com/{href}"
+    
+                        if len(title) > 100:
+                            title = title[:100] + "..."
+                        
+                        if title:
+                            jobs.append(Job(id=job_id, title=title, url=href))
+                            found_on_page += 1
+                
+                logger.info(f"Found {found_on_page} jobs on page {current_page}.")
+                
+                # Check for "Next" button
+                # Selector based on inspection: button with title="Next" or text "›"
+                try:
+                    next_button = page.locator('button[title="Next"]')
+                    if next_button.is_visible() and next_button.is_enabled():
+                        logger.info("Clicking Next page...")
+                        next_button.click()
+                        page.wait_for_load_state("networkidle")
+                        # Add a small sleep to ensure React hydration
+                        page.wait_for_timeout(2000) 
+                        current_page += 1
+                    else:
+                        logger.info("No more pages (Next button not found/disabled).")
+                        break
+                except Exception as e:
+                    logger.warning(f"Pagination error: {e}")
+                    break
             
             browser.close()
         
