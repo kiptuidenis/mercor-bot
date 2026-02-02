@@ -101,13 +101,12 @@ def analyze_job(job: Job) -> bool:
         return False
         
     try:
-        import google.generativeai as genai
+        from google import genai
     except ImportError:
-        logger.error("google-generativeai module not found. Install it with: pip install google-generativeai")
+        logger.error("google-genai module not found. Install it with: pip install google-genai")
         return False
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    client = genai.Client(api_key=api_key)
     
     prompt = f"""
     Analyze the following job description to see if it matches these strict criteria:
@@ -128,15 +127,26 @@ def analyze_job(job: Job) -> bool:
     """
     
     try:
-        response = model.generate_content(prompt)
-        text = response.text.replace('```json', '').replace('```', '')
+        response = client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=prompt
+        )
+        
+        # Clean response text to ensure it's valid JSON
+        text = response.text.strip()
+        if text.startswith('```json'):
+            text = text[7:]
+        if text.endswith('```'):
+            text = text[:-3]
+        text = text.strip()
+            
         result = json.loads(text)
         
-        if result['match']:
-            logger.info(f"MATCH found: {job.title} - {result['reason']}")
+        if result.get('match'):
+            logger.info(f"MATCH found: {job.title} - {result.get('reason')}")
             return True
         else:
-            logger.info(f"No match: {job.title} - {result['reason']}")
+            logger.info(f"No match: {job.title} - {result.get('reason')}")
             return False
             
     except Exception as e:
