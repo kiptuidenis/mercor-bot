@@ -45,50 +45,101 @@ def save_history(history: List[str]):
     with open(HISTORY_FILE, 'w') as f:
         json.dump(history, f, indent=2)
 
+from playwright.sync_api import sync_playwright
+
 def fetch_latest_jobs() -> List[Job]:
-    """Scrape the 'Latest roles' from the Mercor homepage."""
+    """Scrape the 'Latest roles' from the Mercor app using Playwright (infinite scroll)."""
+    jobs = []
     try:
-        response = requests.get(MERCOR_URL, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        jobs = []
-        # Find all links that look like job details
-        # Based on previous research: https://work.mercor.com/jobs/list_...
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            if 'work.mercor.com/jobs/list_' in href:
-                job_id = href.split('list_')[-1]
-                # Basic title extraction (might need refinement based on exact DOM)
-                # Usually the link contains the title or it's nested
-                title = link.get_text(strip=True)
+        with sync_playwright() as p:
+            # Use headless chromium
+            browser = p.chromium.launch(headless=True)
+            # Create context with user agent to avoid basic blocks
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                viewport={'width': 1280, 'height': 800}
+            )
+            page = context.new_page()
+            
+            logger.info(f"Navigating to {MERCOR_URL}...")
+            # Try the work.mercor.com/explore page directly
+            explore_url = "https://work.mercor.com/explore"
+            page.goto(explore_url, timeout=60000)
+            
+            # Wait for some content to load (job cards usually have links with 'jobs/list_')
+            try:
+                page.wait_for_selector('a[href*="jobs/list_"]', timeout=30000)
+            except Exception as e:
+                logger.warning(f"Timeout waiting for job selector: {e}")
+            
+            # Scroll down multiple times to trigger infinite scroll
+            logger.info("Scrolling to load more jobs...")
+            for _ in range(5):  # Scroll 5 times
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(2000)  # Wait for load
                 
-                # Cleanup title if it's too long or messy
-                if len(title) > 100:
-                    title = title[:100] + "..."
-                
-                jobs.append(Job(id=job_id, title=title, url=href))
+            # Now parse content
+            content = page.content()
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Find all links that look like job details
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                if 'jobs/list_' in href:
+                    job_id = href.split('list_')[-1]
+                    title = link.get_text(strip=True)
+                    
+                    # Fix relative URLs
+                    if href.startswith('/'):
+                        href = f"https://work.mercor.com{href}"
+                    elif href.startswith('jobs/'):
+                         href = f"https://work.mercor.com/{href}"
+
+                    # Cleanup title
+                    if len(title) > 100:
+                        title = title[:100] + "..."
+                    
+                    if title: # Only add if title exists
+                        jobs.append(Job(id=job_id, title=title, url=href))
+            
+            browser.close()
         
-        # Deduplicate by ID
+        # Deduplicate
         unique_jobs = {job.id: job for job in jobs}.values()
         return list(unique_jobs)
         
     except Exception as e:
-        logger.error(f"Failed to fetch jobs: {e}")
+        logger.error(f"Failed to fetch jobs with Playwright: {e}")
         return []
 
 def get_job_details(job: Job) -> Job:
-    """Fetch specific details for a job."""
+    """Fetch specific details for a job using Playwright."""
     try:
-        response = requests.get(job.url, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Extract description - attempting to capture the main content
-        # This is a heuristic; actual site structure might vary
-        text_content = soup.get_text(separator=' ', strip=True)
-        job.description = text_content
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                 viewport={'width': 1280, 'height': 800}
+            )
+            page = context.new_page()
+            
+            logger.info(f"Fetching details for {job.url}...")
+            page.goto(job.url, timeout=30000)
+            
+            # Wait for description content - heuristic selector
+            # Usually generic divs or p tags. We just wait for body to settle.
+            page.wait_for_load_state("networkidle")
+            
+            content = page.content()
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Extract description
+            text_content = soup.get_text(separator=' ', strip=True)
+            job.description = text_content
+            
+            browser.close()
         return job
+        
     except Exception as e:
         logger.error(f"Failed to get details for {job.url}: {e}")
         return job
