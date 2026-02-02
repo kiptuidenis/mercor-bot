@@ -1,0 +1,42 @@
+name: Daily Mercor Job Check
+
+on:
+  schedule:
+    # 08:00 EAT is 05:00 UTC
+    - cron: '0 5 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  check-jobs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to commit job_history.json
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Mercor Bot
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          SMTP_SERVER: 'smtp.gmail.com'
+          SMTP_PORT: '587'
+        run: python src/bot.py
+
+      - name: Commit job history
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update job history [skip ci]"
+          file_pattern: "data/job_history.json"
