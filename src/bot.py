@@ -30,77 +30,6 @@ logger = logging.getLogger(__name__)
 HISTORY_FILE = 'data/job_history.json'
 MERCOR_URL = 'https://mercor.com'
 
-# --- OPTIMIZATION: Zero-Cost Filtering ---
-EXCLUDED_KEYWORDS = [
-    r'\bsenior\b', r'\bsr\.\b', r'\blead\b', r'\bprincipal\b', r'\bmanager\b', 
-    r'\bdirector\b', r'\bhead of\b', r'\bvp\b', r'\barchitect\b',
-    r'\bphd\b', r'\bmd\b', r'\bjd\b', r'\bexpert\b', r'\badvanced\b', 
-    r'\bexperienced\b', r'\biii\b', r'\biv\b'
-]
-# Exceptions for "Manager" roles that might be entry level (though rare, good to have)
-ALLOWED_EXCEPTIONS = [
-    r'product manager', r'project manager', r'community manager'
-]
-
-def is_excluded_title(title: str) -> bool:
-    """Return True if title contains senior/advanced keywords."""
-    title_lower = title.lower()
-    
-    # Check for exceptions first
-    for exc in ALLOWED_EXCEPTIONS:
-        if re.search(exc, title_lower):
-            return False
-            
-    # Check exclusions
-    for pattern in EXCLUDED_KEYWORDS:
-        if re.search(pattern, title_lower):
-            logger.info(f"Skipping job '{title}' due to exclusion keyword: {pattern}")
-            return True
-            
-    return False
-
-# --- OPTIMIZATION: Smart Extraction ---
-def optimize_description(text: str) -> str:
-    """
-    Condense description to save tokens.
-    Priority: "Requirements/Qualifications" section.
-    Fallback: First 3000 chars.
-    """
-    if not text:
-        return ""
-        
-    # Text is often Markdown from JSON-LD or raw text
-    # Look for headers
-    headers = [
-        "Requirements", "Qualifications", "What you bring", "Who you are", 
-        "Ideal Candidate", "Skills", "Prerequisites"
-    ]
-    
-    # Try to find a header
-    best_start = -1
-    for header in headers:
-        # Check for markdown header (**Header**) or plain text
-        idx = text.find(header)
-        if idx != -1:
-            if best_start == -1 or idx < best_start:
-                best_start = idx
-    
-    if best_start != -1:
-        # Found a relevant section!
-        # Take from that section onwards, up to 3000 chars
-        # Often valid info is 500 chars before (Role overview) + the requirements
-        start_safe = max(0, best_start - 500) 
-        optimized = text[start_safe:]
-    else:
-        # No header found, take the top (usually summary + bullets)
-        optimized = text
-        
-    # Hard limit to 3000 chars (~750 tokens)
-    if len(optimized) > 3000:
-        optimized = optimized[:3000] + "\n...[TRUNCATED]..."
-        
-    return optimized
-
 @dataclass
 class Job:
     id: str
@@ -289,10 +218,6 @@ def main():
                         if len(title) > 100:
                             title = title[:100] + "..."
                         
-                        # --- OPTIMIZATION 1: Zero-Cost Filter ---
-                        if is_excluded_title(title):
-                            continue
-
                         jobs.append(Job(id=job_id, title=title, url=job_url))
                         found_count += 1
                 
@@ -330,27 +255,9 @@ def main():
                         page.wait_for_load_state("domcontentloaded", timeout=10000)
                     except: pass
                     
-                    # --- OPTIMIZATION 2: JSON-LD Extraction ---
-                    description = ""
-                    try:
-                        # Try to get structured data first (much cleaner/smaller)
-                        json_ld_handle = page.locator('script[type="application/ld+json"]').first
-                        if json_ld_handle.count() > 0:
-                            json_text = json_ld_handle.text_content()
-                            data = json.loads(json_text)
-                            description = data.get('description', '')
-                            logger.info("Extracted description from JSON-LD.")
-                    except Exception as e:
-                        logger.warning(f"JSON-LD extraction failed: {e}")
-
-                    if not description:
-                        # Fallback to full HTML text
-                        content = page.content()
-                        soup = BeautifulSoup(content, 'html.parser')
-                        description = soup.get_text(separator=' ', strip=True)
-                    
-                    # --- OPTIMIZATION 3: Smart Truncation ---
-                    job.description = optimize_description(description)
+                    content = page.content()
+                    soup = BeautifulSoup(content, 'html.parser')
+                    job.description = soup.get_text(separator=' ', strip=True)
                     
                     # Analyze if client exists
                     if genai_client:
