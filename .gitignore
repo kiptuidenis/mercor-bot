@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.env
+venv/
+.vscode/
+page_links_dump.txt
+data/job_history.json

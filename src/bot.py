@@ -2,13 +2,22 @@ import os
 import json
 import logging
 import smtplib
-import smtplib
 import requests
+import re
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from bs4 import BeautifulSoup
 from dataclasses import dataclass
 from typing import List, Optional
+from playwright.sync_api import sync_playwright
+
+# Load environment variables
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Configure logging
 logging.basicConfig(
@@ -45,157 +54,11 @@ def save_history(history: List[str]):
     with open(HISTORY_FILE, 'w') as f:
         json.dump(history, f, indent=2)
 
-from playwright.sync_api import sync_playwright
-
-def fetch_latest_jobs() -> List[Job]:
-    """Scrape the 'Latest roles' from the Mercor app or 'Explore' page using Playwright."""
-    jobs = []
-    try:
-        with sync_playwright() as p:
-            # Run visible for debugging & ensuring assets load (sometimes headless is blocked)
-            browser = p.chromium.launch(headless=False) 
-            
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                viewport={'width': 1366, 'height': 768}
-            )
-            page = context.new_page()
-            
-            logger.info(f"Navigating to {MERCOR_URL}...")
-            # Use the explore URL clearly
-            explore_url = "https://work.mercor.com/explore"
-            page.goto(explore_url, timeout=60000)
-            
-            # Wait for any network activity to settle
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except:
-                pass # Continue even if network is busy
-            
-            # Check if redirected to login
-            if "/login" in page.url or "auth-wall" in page.url:
-                logger.error(f"Redirected to login/auth page: {page.url}. Cannot scrape public jobs.")
-                browser.close()
-                return []
-            
-            logger.info("Checking for job cards...")
-            # Wait for *any* link that might be a job, or at least the container
-            try:
-                # Based on user report, links contain 'jobs/list_'
-                page.wait_for_selector('a[href*="jobs/list_"]', timeout=30000)
-            except Exception as e:
-                logger.warning(f"Timeout waiting for job selector on {page.url}. Page title: {page.title()}")
-                # Dump content snippet to log for debugging
-                content_snippet = page.content()[:500]
-                logger.debug(f"Page content snippet: {content_snippet}")
-                
-            # Pagination Loop
-            max_pages = 5
-            current_page = 1
-            
-            while current_page <= max_pages:
-                logger.info(f"Scraping page {current_page}...")
-                
-                # Parse current page
-                content = page.content()
-                soup = BeautifulSoup(content, 'html.parser')
-                
-                found_on_page = 0
-                for link in soup.find_all('a', href=True):
-                    href = link['href']
-                    if 'jobs/list_' in href:
-                        job_id = href.split('list_')[-1]
-                        title = link.get_text(strip=True)
-                        
-                        if href.startswith('/'):
-                            href = f"https://work.mercor.com{href}"
-                        elif href.startswith('jobs/'):
-                             href = f"https://work.mercor.com/{href}"
-    
-                        if len(title) > 100:
-                            title = title[:100] + "..."
-                        
-                        if title:
-                            jobs.append(Job(id=job_id, title=title, url=href))
-                            found_on_page += 1
-                
-                logger.info(f"Found {found_on_page} jobs on page {current_page}.")
-                
-                # Check for "Next" button
-                # Selector based on inspection: button with title="Next" or text "›"
-                try:
-                    next_button = page.locator('button[title="Next"]')
-                    if next_button.is_visible() and next_button.is_enabled():
-                        logger.info("Clicking Next page...")
-                        next_button.click()
-                        page.wait_for_load_state("networkidle")
-                        # Add a small sleep to ensure React hydration
-                        page.wait_for_timeout(2000) 
-                        current_page += 1
-                    else:
-                        logger.info("No more pages (Next button not found/disabled).")
-                        break
-                except Exception as e:
-                    logger.warning(f"Pagination error: {e}")
-                    break
-            
-            browser.close()
-        
-        # Deduplicate
-        unique_jobs = {job.id: job for job in jobs}.values()
-        return list(unique_jobs)
-        
-    except Exception as e:
-        logger.error(f"Failed to fetch jobs with Playwright: {e}")
-        return []
-
-def get_job_details(job: Job) -> Job:
-    """Fetch specific details for a job using Playwright."""
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                 viewport={'width': 1280, 'height': 800}
-            )
-            page = context.new_page()
-            
-            logger.info(f"Fetching details for {job.url}...")
-            page.goto(job.url, timeout=30000)
-            
-            # Wait for description content - heuristic selector
-            # Usually generic divs or p tags. We just wait for body to settle.
-            page.wait_for_load_state("networkidle")
-            
-            content = page.content()
-            soup = BeautifulSoup(content, 'html.parser')
-            
-            # Extract description
-            text_content = soup.get_text(separator=' ', strip=True)
-            job.description = text_content
-            
-            browser.close()
-        return job
-        
-    except Exception as e:
-        logger.error(f"Failed to get details for {job.url}: {e}")
-        return job
-
-def analyze_job(job: Job) -> bool:
+def analyze_job(job: Job, client) -> bool:
     """Use Gemini to determine if the job matches criteria."""
-    api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key:
-        logger.warning("GEMINI_API_KEY not set. Skipping analysis.")
+    if not client:
         return False
         
-    try:
-        from google import genai
-    except ImportError:
-        logger.error("google-genai module not found. Install it with: pip install google-genai")
-        return False
-
-    client = genai.Client(api_key=api_key)
-    
     prompt = f"""
     Analyze the following job description to see if it matches these strict criteria:
     
@@ -216,11 +79,11 @@ def analyze_job(job: Job) -> bool:
     
     try:
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            model='gemini-2.5-flash',
             contents=prompt
         )
         
-        # Clean response text to ensure it's valid JSON
+        # Clean response text
         text = response.text.strip()
         if text.startswith('```json'):
             text = text[7:]
@@ -277,28 +140,143 @@ def send_email(matches: List[Job]):
 def main():
     logger.info("Starting Mercor Job Bot")
     
-    history = load_history()
-    all_jobs = fetch_latest_jobs()
-    
-    new_jobs = [j for j in all_jobs if j.id not in history]
-    logger.info(f"Found {len(new_jobs)} new jobs to analyze")
-    
-    matches = []
-    processed_ids = []
-    
-    for job in new_jobs:
-        job = get_job_details(job)
-        if analyze_job(job):
-            matches.append(job)
-        processed_ids.append(job.id)
-        
-    if matches:
-        send_email(matches)
+    # Initialize Gemini Client
+    api_key = os.getenv('GEMINI_API_KEY')
+    genai_client = None
+    if api_key:
+        try:
+            from google import genai
+            genai_client = genai.Client(api_key=api_key)
+        except ImportError:
+            logger.error("google-genai module not found.")
     else:
-        logger.info("No matches found matching criteria.")
-        
-    # Update history
-    save_history(history + processed_ids)
+        logger.warning("GEMINI_API_KEY not set. Analysis will be skipped.")
+
+    history = load_history()
+    jobs = []
+    
+    try:
+        with sync_playwright() as p:
+            # Launch browser ONCE
+            logger.info("Launching browser...")
+            browser = p.chromium.launch(headless=False)
+            context = browser.new_context(viewport={'width': 1366, 'height': 768})
+            page = context.new_page()
+            
+            # --- PHASE 1: DISCOVERY ---
+            logger.info(f"Navigating to {MERCOR_URL}...")
+            try:
+                page.goto("https://work.mercor.com/explore", timeout=60000)
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except:
+                pass # Proceed even if network is busy
+            
+            # Check for redirect
+            if "/login" in page.url or "auth-wall" in page.url:
+                logger.error("Redirected to login. Cannot scrape.")
+                browser.close()
+                return
+
+            # Wait for job listings
+            logger.info("Scanning for jobs...")
+            try:
+                page.wait_for_selector('a[href*="listingId="]', timeout=30000)
+            except Exception as e:
+                logger.warning(f"Timeout waiting for first job selector: {e}")
+
+            # Pagination
+            max_pages = 5
+            current_page = 1
+            
+            while current_page <= max_pages:
+                content = page.content()
+                soup = BeautifulSoup(content, 'html.parser')
+                
+                found_count = 0
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    job_id = None
+                    
+                    if 'listingId=' in href:
+                        match = re.search(r'listingId=(list_[\w-]+)', href)
+                        if match: job_id = match.group(1)
+                    elif 'jobs/list_' in href:
+                        job_id = href.split('list_')[-1]
+                        
+                    if job_id:
+                        job_url = f"https://work.mercor.com/jobs/{job_id}"
+                        # Clean title
+                        title = link.get_text(strip=True)
+                        if "Apply" in title: title = title.split("Apply")[0].strip()
+                        if len(title) > 100: title = title[:100] + "..."
+                        
+                        jobs.append(Job(id=job_id, title=title, url=job_url))
+                        found_count += 1
+                
+                logger.info(f"Page {current_page}: Found {found_count} jobs.")
+                
+                # Check for Next button
+                try:
+                    next_btn = page.locator('button[title="Next"]')
+                    if next_btn.is_visible() and next_btn.is_enabled():
+                        next_btn.click()
+                        page.wait_for_timeout(2000)
+                        current_page += 1
+                    else:
+                        break
+                except:
+                    break
+                    
+            # --- PHASE 2: DETAILS & ANALYSIS ---
+            # Deduplicate
+            unique_jobs = {j.id: j for j in jobs}.values()
+            new_jobs = [j for j in unique_jobs if j.id not in history]
+            logger.info(f"Found {len(new_jobs)} new jobs to process.")
+            
+            matches = []
+            processed_ids = []
+            
+            for i, job in enumerate(new_jobs):
+                logger.info(f"Processing ({i+1}/{len(new_jobs)}): {job.url}")
+                try:
+                    # Navigate to job details using SAME page
+                    page.goto(job.url, timeout=30000)
+                    
+                    # Faster wait strategy
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except: pass
+                    
+                    content = page.content()
+                    soup = BeautifulSoup(content, 'html.parser')
+                    job.description = soup.get_text(separator=' ', strip=True)
+                    
+                    # Analyze if client exists
+                    if genai_client:
+                        if analyze_job(job, genai_client):
+                            matches.append(job)
+                    
+                    processed_ids.append(job.id)
+                    
+                    # Save history specifically after each success to prevent data loss
+                    if len(processed_ids) % 5 == 0:
+                        save_history(history + processed_ids)
+                        
+                except Exception as e:
+                    logger.error(f"Failed to process {job.id}: {e}")
+            
+            # Final save
+            save_history(history + processed_ids)
+            browser.close()
+            
+            if matches:
+                send_email(matches)
+            else:
+                logger.info("No matches found.")
+
+    except Exception as e:
+        logger.error(f"Bot crash: {e}")
+    
     logger.info("Bot execution complete")
 
 if __name__ == "__main__":
