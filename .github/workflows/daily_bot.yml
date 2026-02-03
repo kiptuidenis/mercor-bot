@@ -1,9 +1,9 @@
-name: Daily Mercor Job Check
+name: Mercor Job Check (Every 5 Hours)
 
 on:
   schedule:
-    # 08:00 EAT is 05:00 UTC
-    - cron: '0 5 * * *'
+    # Runs every 5 hours (at minute 0)
+    - cron: '0 */5 * * *'
   workflow_dispatch: # Allow manual trigger
 
 jobs:
