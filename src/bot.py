@@ -158,8 +158,13 @@ def main():
     try:
         with sync_playwright() as p:
             # Launch browser ONCE
-            logger.info("Launching browser...")
-            browser = p.chromium.launch(headless=False)
+            # Auto-detect CI environment or use HEADLESS env var
+            is_ci = os.getenv('GITHUB_ACTIONS') == 'true'
+            force_headless = os.getenv('HEADLESS', 'false').lower() == 'true'
+            use_headless = is_ci or force_headless
+            
+            logger.info(f"Launching browser (Headless: {use_headless})...")
+            browser = p.chromium.launch(headless=use_headless)
             context = browser.new_context(viewport={'width': 1366, 'height': 768})
             page = context.new_page()
             
